@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 from databaseImport import sqliteRead as sr
 import logging 
 import os 

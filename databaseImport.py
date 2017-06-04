@@ -1,6 +1,9 @@
+#!/usr/bin/env python
+
 import sqlite3
 import psycopg2 as pg ## Postgres interface for Python
 import logging
+from threading import Thread
 logger = logging.getLogger(__name__)
 
 def pretty(d, indent=0):
@@ -12,7 +15,11 @@ def pretty(d, indent=0):
          print '\t' * (indent+1) + str(value)
 
 class sqliteRead:
-    def __init__(self, source=None, logger=None):
+    def __init__(self, source=None, k=4):
+        ## Set the number of threads to use
+        self.k = k
+        self.threads = [] ## Stores thread object
+        
         ## Setting up connections to sqlite3 database. Our source
         if source == None:
             raise ValueError('No file path given or URL to sqlite3 database')
@@ -33,8 +40,6 @@ class sqliteRead:
             logging.info('Connection Status with AWD RDS: Active')
         else:
             logging.info('Connection Status with AWD RDS: Failed')
-
-
 
     def getSchema(self):
         # command = 'select cellID, trackID, area from tblCells where time = 1'
@@ -142,35 +147,61 @@ class sqliteRead:
 
         for key in self.schema.keys():
             # key = 'tblEditList'
+            row_count = 'select count(*) from {0}'.format(key)
+            self.cursor.execute(row_count)
+
+            rows = self.cursor.fetchall()
+            logger.info('Number of rows for {0} is {1}'.format(key, rows))
+            
             command = 'select * from {0}'.format(key)
-            
             self.cursor.execute(command)
-            ## Extract select all row by row to relieve 
-            ## pressure from local cache
-            row = self.cursor.fetchone()
-            if row is None:
-                continue
-            logger.debug('Result of row from {1} query:\n{0}\n'.format(row, key))
-            temp = ''
-            temp2 = ''
-            for i in self.schema[key]:
-                temp = temp + i['name'] + ', '
-                temp2 = temp2 + "%s,"
-            temp = temp[:-2]
-            temp2 = temp2[:-1]
-            
-            ins = 'insert into {0} ({1}) values ({2})'.format(key, temp, temp2)
+
+            block_size = rows[0][0] / self.k
+            block_rem = rows[0][0] % self.k
+
+            ## Instantiate threads
+            for i in range(1, self.k + 1):
+                offset = block_size * i
+                if (i == self.k):
+                    offset = offset + block_rem
+
+                data = self.cursor.fetchmany(offset) #Batch Processing
+                t = Thread(target=self.fetchAndPut, args=(key, data))
+                t.start()
+                self.threads.append(t)
+
+            for j in self.threads:
+                j.join() ## Blocking join call to ensure op finishes
+
+
+
+    def fetchAndPut(self, table, data):
+
+        ## Extract select all row by row to relieve 
+        ## pressure from local cache
+        if data is None:
+            # continue
+            return
+        # logger.debug('Result of row from {1} query:\n{0}\n'.format(row, table))
+        ## Generate insert query into postgres
+        temp = ''
+        temp2 = ''
+        for j in self.schema[table]:
+            temp = temp + j['name'] + ', '
+            temp2 = temp2 + "%s,"
+        temp = temp[:-2]
+        temp2 = temp2[:-1]
+        
+        ins = 'insert into {0} ({1}) values ({2})'.format(table, temp, temp2)
+        logger.info('Insert Query:\n {}\n'.format(ins))
+        # self.pgcursor.execute(ins, row)
+        for i in data:
+            logger.debug('Result of row from {1} query:\n{0}\n'.format(i, table))
             logger.info('Insert Query:\n {}\n'.format(ins))
-            self.pgcursor.execute(ins, row)
-            while(row):
-                logger.debug('Result of row from {1} query:\n{0}\n'.format(row, key))
-                logger.info('Insert Query:\n {}\n'.format(ins))
-                row = self.cursor.fetchone()
-                try:
-                    self.pgcursor.execute(ins, row)
-                except:
-                    logger.debug('Entry failed')
+            try:
+                self.pgcursor.execute(ins, i)
+            except:
+                logger.debug('Entry failed')
 
-            # self.pgconn.commit()
-            # break
-
+        # self.pgconn.commit()
+        # break
